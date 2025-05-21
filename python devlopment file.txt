@@ -1,0 +1,398 @@
+import logging
+import sys
+from operator import concat
+from typing import Dict, List, Optional, Union
+
+import pyspark.sql.functions as f
+import pyspark.sql.types as t
+from pg_composite_pipelines_configuration.configuration import Configuration
+
+from pg_tw_fa_marm_reporting.common import get_dbutils, get_spark
+
+table_2_cmpr_pk_columns = ["prod_id", "stock_keep_alt_uom"]
+columns_2_compare = [
+    "numerator_alt_uom_buom_factor",
+    "denominator_alt_uom_buom_factor",
+    "length_val",
+    "width_val",
+    "height_val",
+    "dimension_uom",
+    "vol_qty",
+    "vol_uom",
+    "gross_weight_val",
+    "weight_uom",
+    "max_stack_factor",
+]
+
+table_2_cmpr_name = "marm"
+
+table_2_cmpr_pk_columns_new = ["matnr", "meinh"]
+columns_2_compare_new = [
+    "umrez",
+    "umren",
+    "laeng",
+    "breit",
+    "hoehe",
+    "meabm",
+    "volum",
+    "voleh",
+    "brgew",
+    "gewei",
+    "max_stack",
+]
+
+
+def add_pre_post_fix_in_list(prefix_name, postfix_name, cols_list, exception_list):
+    """Add postfix/prefix to a list of strings (columns)"""
+    out_cols_list = []
+    new_prefix_name = (prefix_name + "_" if prefix_name else prefix_name).lower()
+    new_postfix_name = ("_" + postfix_name if postfix_name else postfix_name).lower()
+    for col_name in cols_list:
+        if col_name in exception_list:
+            out_cols_list.append(col_name)
+        else:
+            out_cols_list.append(
+                "{}{}{}".format(new_prefix_name, col_name, new_postfix_name)
+            )
+    return out_cols_list
+
+
+def get_discr_report(
+    spark,
+    logger,
+    regional_table_df,
+    g11_table_df,
+    table_2_cmpr_pk_columns,
+    columns_2_compare,
+    cmpr_table_columns,
+    target_columns,
+    target_db_name,
+):
+    """XXXXXX"""
+    logger.info("Getting a report with discrepancies on values...")
+
+    # Adding prefix "reg" to differentiate the columns after join with "g11"
+    reg_table_renamed_cols_df = regional_table_df.select(cmpr_table_columns).toDF(
+        *add_pre_post_fix_in_list(
+            "reg", "", cmpr_table_columns, table_2_cmpr_pk_columns
+        )
+    )
+
+    # Adding prefix "g11" to differentiate  the columns after join with "regional"
+    g11_table_renamed_cols_df = g11_table_df.select(cmpr_table_columns).toDF(
+        *add_pre_post_fix_in_list(
+            "g11", "", cmpr_table_columns, table_2_cmpr_pk_columns
+        )
+    )
+
+    # Joinin reg & g11 datasets
+    reg_g11_df = reg_table_renamed_cols_df.join(
+        g11_table_renamed_cols_df, table_2_cmpr_pk_columns, "inner"
+    )
+
+    reg_g11_unpivoted_df = unpivot_dataframe(spark, reg_g11_df, columns_2_compare)
+    time_zone = spark.conf.get("spark.sql.session.timeZone")
+    reg_g11_unpivoted_trimmed_df = trim_and_replace_nulls_with_empty_string_in_columns(
+        spark, reg_g11_unpivoted_df, ["regional_val", "g11_val"]
+    )
+    reg_g11_discr_report_df = (
+        reg_g11_unpivoted_trimmed_df.withColumn(
+            "sap_box_name", f.substring(f.col("reg_sap_box_name"), 5, 3)
+        )
+        .where(
+            f.when(
+                (f.col("regional_val") == f.col("g11_val"))
+                | (f.col("regional_val").isNull() & f.col("g11_val").isNull()),
+                False,
+            ).otherwise(True)
+        )
+        .withColumn(
+            "last_update_utc_tmstp",
+            f.to_utc_timestamp(f.current_timestamp(), time_zone),
+        )
+        .select(target_columns)
+    )
+
+    return reg_g11_discr_report_df
+
+
+def unpivot_dataframe(spark, df_2_unpivot, column_list_2_pivot):
+
+    # Create a case for a new column with value from a proper column after cross join
+    case_condition = "CASE column_name"
+    for clmn in column_list_2_pivot:
+        case_condition += ' WHEN "' + clmn + '" THEN g11_' + clmn
+    case_condition += " END"
+
+    df_2_unpivot_crossed = df_2_unpivot.crossJoin(
+        spark.createDataFrame(column_list_2_pivot, t.StringType()).withColumnRenamed(
+            "value", "column_name"
+        )
+    )
+    unpivoted_df = df_2_unpivot_crossed.withColumn(
+        "g11_val", f.expr(case_condition)
+    ).withColumn("regional_val", f.expr(case_condition.replace("g11_", "reg_")))
+    return unpivoted_df
+
+
+def trim_and_replace_nulls_with_empty_string_in_columns(
+    spark, data_frame, columns_2_change
+):
+
+    for column in columns_2_change:
+        data_frame = data_frame.withColumn(column, f.trim(f.col(column))).withColumn(
+            column, f.nanvl(column, f.lit("")).cast(t.StringType())
+        )
+    return data_frame
+
+
+def get_missing_data_report(
+    spark,
+    logger,
+    regional_table_df,
+    g11_table_df,
+    table_2_cmpr_pk_columns,
+    target_columns,
+    target_db_name,
+):
+    """XXXXXX"""
+
+    logger.info("Getting a report with missing values in G11...")
+
+    time_zone = spark.conf.get("spark.sql.session.timeZone")
+    reg_g11_missing_df = (
+        regional_table_df.join(
+            g11_table_df.select(table_2_cmpr_pk_columns),
+            table_2_cmpr_pk_columns,
+            "left_anti",
+        )
+        .select(table_2_cmpr_pk_columns + ["sap_box_name"])
+        .withColumn("column_name", f.lit("missing_G11_data"))
+        .withColumn("regional_val", f.lit(None))
+        .withColumn("g11_val", f.lit(None))
+        .withColumn("sap_box_name", f.substring(f.col("sap_box_name"), 5, 3))
+        .withColumn(
+            "last_update_utc_tmstp",
+            f.to_utc_timestamp(f.current_timestamp(), time_zone),
+        )
+        .select(target_columns)
+    )
+    return reg_g11_missing_df
+
+
+def get_table_check_error_report(
+    spark,
+    logger,
+    region,
+    regional_db_name,
+    g11_db_name,
+    table_2_cmpr_name,
+    table_2_cmpr_pk_columns,
+    table_2_cmpr_pk_columns_new,
+    columns_2_compare,
+    columns_2_compare_new,
+    target_db_name,
+    target_table,
+):
+    """Create a report with discrepancies between G11 vs regional SAP box for a table."""
+
+    logger.info(
+        "Create a report with discrepancies between G11 vs regional SAP box for a table."
+    )
+
+    cmpr_table_columns = table_2_cmpr_pk_columns + columns_2_compare + ["sap_box_name"]
+    cmpr_table_columns_new = (
+        table_2_cmpr_pk_columns_new + columns_2_compare_new + ["sap_box_name"]
+    )
+
+    logger.info("Loading regional table data...")
+
+    regional_table_df = (
+        spark.read.table("{}.{}".format(regional_db_name, table_2_cmpr_name))
+        .select(cmpr_table_columns_new)
+        .where(
+            "sap_chng_type_code != 'D'"
+            if region == "N6P"
+            else "simp_chng_type_code != 'D'"
+        )
+        .withColumnRenamed("matnr", "prod_id")
+        .withColumnRenamed("meinh", "stock_keep_alt_uom")
+        .withColumnRenamed("umrez", "numerator_alt_uom_buom_factor")
+        .withColumnRenamed("umren", "denominator_alt_uom_buom_factor")
+        .withColumnRenamed("laeng", "length_val")
+        .withColumnRenamed("breit", "width_val")
+        .withColumnRenamed("hoehe", "height_val")
+        .withColumnRenamed("meabm", "dimension_uom")
+        .withColumnRenamed("volum", "vol_qty")
+        .withColumnRenamed("voleh", "vol_uom")
+        .withColumnRenamed("brgew", "gross_weight_val")
+        .withColumnRenamed("gewei", "weight_uom")
+        .withColumnRenamed("max_stack", "max_stack_factor")
+    )
+
+    logger.info("Loading g11 table data...")
+
+    g11_table_df = (
+        spark.read.table("{}.{}".format(g11_db_name, table_2_cmpr_name))
+        .select(cmpr_table_columns_new)
+        .withColumnRenamed("matnr", "prod_id")
+        .withColumnRenamed("meinh", "stock_keep_alt_uom")
+        .withColumnRenamed("umrez", "numerator_alt_uom_buom_factor")
+        .withColumnRenamed("umren", "denominator_alt_uom_buom_factor")
+        .withColumnRenamed("laeng", "length_val")
+        .withColumnRenamed("breit", "width_val")
+        .withColumnRenamed("hoehe", "height_val")
+        .withColumnRenamed("meabm", "dimension_uom")
+        .withColumnRenamed("volum", "vol_qty")
+        .withColumnRenamed("voleh", "vol_uom")
+        .withColumnRenamed("brgew", "gross_weight_val")
+        .withColumnRenamed("gewei", "weight_uom")
+        .withColumnRenamed("max_stack", "max_stack_factor")
+    )
+    target_columns = spark.read.table(
+        "{}.{}".format(target_db_name, target_table)
+    ).columns
+
+    # Get a report with discrepancies on values
+    reg_g11_discr_report_df = get_discr_report(
+        spark,
+        logger,
+        regional_table_df,
+        g11_table_df,
+        table_2_cmpr_pk_columns,
+        columns_2_compare,
+        cmpr_table_columns,
+        target_columns,
+        target_db_name,
+    )
+    # Get a report with missing values in G11
+    reg_g11_missing_report_df = get_missing_data_report(
+        spark,
+        logger,
+        regional_table_df,
+        g11_table_df,
+        table_2_cmpr_pk_columns,
+        target_columns,
+        target_db_name,
+    )
+    time_zone = spark.conf.get("spark.sql.session.timeZone")
+    final_reg_g11_discr_report_df = reg_g11_discr_report_df.union(
+        reg_g11_missing_report_df
+    ).select(target_columns)
+
+    return final_reg_g11_discr_report_df
+
+
+def load_prod_uom_error_report_star(
+    spark,
+    logger,
+    g11_db_name,
+    regional_db_name,
+    target_db_name,
+    target_table,
+    table_2_cmpr_name,
+    table_2_cmpr_pk_columns,
+    table_2_cmpr_pk_columns_new,
+    columns_2_compare,
+    columns_2_compare_new,
+    region,
+):
+    """ """
+
+    spark.conf.set("hive.exec.dynamic.partition", "true")
+    spark.conf.set("hive.exec.dynamic.partition.mode", "nonstrict")
+    spark.conf.set("spark.databricks.delta.write.isolationLevel", "Serializable")
+    spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
+
+    logger.info(
+        "Loading Final UOM ERROR REPORT into %s....\n",
+        f"{target_db_name}.{target_table}",
+    )
+
+    marm_check_error_report = get_table_check_error_report(
+        spark,
+        logger,
+        region,
+        regional_db_name,
+        g11_db_name,
+        table_2_cmpr_name,
+        table_2_cmpr_pk_columns,
+        table_2_cmpr_pk_columns_new,
+        columns_2_compare,
+        columns_2_compare_new,
+        target_db_name,
+        target_table,
+    )
+
+    # Insert into final table
+    # marm_check_error_report.write.insertInto(
+    #     tableName="{}.{}".format(target_db_name, target_table), overwrite=True
+    # )
+    marm_check_error_report.write.format("delta").mode("overwrite").option(
+        "replaceWhere", f"sap_box_name = '{region}'"
+    ).saveAsTable(f"{target_db_name}.{target_table}")
+
+    logger.info(
+        " Final UOM ERROR REPORT has been successfully loaded into %s....\n",
+        f"{target_db_name}.{target_table}",
+    )
+
+    return 0
+
+
+def main():
+    spark = get_spark()
+    dbutils = get_dbutils()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+
+    config = Configuration.load_for_default_environment(__file__, dbutils)
+
+    args = sys.argv
+
+    catalog, schema = config["catalog-name"], config["schema-name"]
+
+    # table_config = config["tables"][0]
+
+    spark = get_spark()
+    g11_db_name = f"{config['src-catalog-name']}.{config['g11_db_name']}"
+
+    schema = f"{config['catalog-name']}.{config['schema-name']}"
+
+    target_table = f"{config['tables']['prod_uom_error_report_star']}"
+
+    print(args)
+    region = args[1]
+    regional_db_name = (
+        f"{config['src-catalog-name']}.{config['region-schema-name'][region]}"
+    )
+
+    logger.info("Regional source table name: %s", regional_db_name)
+    logger.info("g11 source db name %s", g11_db_name)
+    logger.info("target_table %s", target_table)
+
+    load_prod_uom_error_report_star(
+        spark=spark,
+        logger=logger,
+        regional_db_name=regional_db_name,
+        g11_db_name=g11_db_name,
+        target_db_name=schema,
+        target_table=target_table,
+        table_2_cmpr_name=table_2_cmpr_name,
+        table_2_cmpr_pk_columns=table_2_cmpr_pk_columns,
+        table_2_cmpr_pk_columns_new=table_2_cmpr_pk_columns_new,
+        columns_2_compare=columns_2_compare,
+        columns_2_compare_new=columns_2_compare_new,
+        region=region,
+    )
+
+
+if __name__ == "__main__":
+    # if you need to read params from your task/workflow, use sys.argv[] to retrieve them and pass them to main here
+    # eg sys.argv[0] for first positional param
+    main()
