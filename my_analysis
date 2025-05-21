@@ -1,0 +1,43 @@
+1) Main difference in refactor
+
+The refactored new file consolidates and modularizes the logic spread across:
+
+get_table_check_error_report
+
+get_discr_report
+
+get_missing_data_report
+
+Utility/helper methods like unpivoting and cleaning
+
+2) function difference 
+
+older                          
+unpivot_dataframe() and 
+trim_and_replace_nulls_with_
+empty_string_in_columns()
+
+vs 
+
+New
+
+Inlined directly in the logic
+
+3) some important key points 
+
+Redundant function calls and excessive logging were removed.
+
+Unpivoting logic is now local to the comparison function.
+
+Union of discrepancy and missing reports done directly with column renaming
+
+calc analysis
+used in utility older
+1) get_spark_session not requried in new spark = get_spark()
+This uses get_spark() from:
+from pg_tw_fa_marm_reporting.common import get_spark
+2)removeDebugTables
+removeDebugTables() is intentionally not migrated because the debug logic was removed by design.
+3) Managedoutput
+integrate to new script
+
