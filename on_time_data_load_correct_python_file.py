@@ -1,0 +1,447 @@
+#!/usr/bin/env python
+import sys
+import os
+import datetime
+import logging
+
+import pyspark
+import pyspark.sql.functions as f
+import pyspark.sql.types as t
+from pyspark.sql import Window
+
+# Additional libraries per request
+from pg_composite_pipelines_configuration.configuration import Configuration
+
+# Import Transfix functions and expression definitions (kept as is)
+from get_src_data import get_transfix as tvb
+from load_otd import expr_on_time_data_hub as expr
+
+# --- CONSTANTS (update as needed) ---
+RDS_DB_NAME = "rds_db"             # Replace with your actual RDS database name
+TRANS_VB_DB_NAME = "trans_vb_db"   # Replace with your actual Transfix database name
+TARGET_DB_NAME = "target_db"       # Replace with your actual target DB name
+DEBUG_SUFFIX = "_DEBUG"            # Fixed debug suffix
+
+# --- INLINE FUNCTIONS FROM get_rds (now part of the main script) ---
+
+def get_cust_dim(log, spark, src_db_name):
+    log.info("Started selecting cust_dim from %s.", src_db_name)
+    sql_query = f"""
+        SELECT cust_id,
+               trade_chanl_curr_id AS trade_chanl_id
+        FROM {src_db_name}.cust_dim
+        WHERE curr_ind = 'Y'
+    """
+    df = spark.sql(sql_query)
+    log.info("Selecting cust_dim from %s has finished.", src_db_name)
+    return df
+
+def get_trade_chanl_hier_dim(log, spark, src_db_name):
+    log.info("Started selecting trade_chanl_hier_dim from %s.", src_db_name)
+    sql_query = f"""
+        SELECT trade_chanl_2_long_name AS channel_name,
+               trade_chanl_7_id AS trade_chanl_id
+        FROM {src_db_name}.trade_chanl_hier_dim
+        WHERE curr_ind = 'Y'
+          AND trade_chanl_hier_id = '658'
+    """
+    df = spark.sql(sql_query)
+    log.info("Selecting trade_chanl_hier_dim from %s has finished.", src_db_name)
+    return df
+
+# --- INLINE UTILITY FUNCTIONS (from the utility module) ---
+
+def manageOutput(log, spark, df, cache_ind, df_name, target_db_name):
+    """
+    Simplified manageOutput function.
+    When cache_ind == 1, registers a temporary view and caches the DataFrame.
+    """
+    if cache_ind == 1:
+        temp_view = df_name + DEBUG_SUFFIX.upper() + "_CACHE_VW"
+        df.createOrReplaceTempView(temp_view)
+        spark.sql(f"CACHE TABLE {temp_view}")
+        log.info("Data frame '%s' cached as %s.", df_name, temp_view)
+    return
+
+def removeDebugTables(log, spark, target_db_name):
+    """
+    Remove any tables in target_db_name that end with the DEBUG_SUFFIX.
+    """
+    debug_postfix = DEBUG_SUFFIX.upper()
+    spark.sql(f"USE {target_db_name}")
+    tables = spark.sql("SHOW TABLES")
+    log.info("Started dropping DEBUG tables.")
+    for row in tables.collect():
+        if row.tableName.upper().endswith(debug_postfix):
+            spark.sql(f"DROP TABLE IF EXISTS {row.database}.{row.tableName}")
+            log.info("Dropped table %s.%s", row.database, row.tableName)
+    return
+
+def get_spark_session(log, job_prefix, master, spark_config):
+    """
+    Create or retrieve a SparkSession using the provided configuration.
+    """
+    conf = pyspark.SparkConf()
+    dt = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    app_name = f"{job_prefix}_{dt}_{os.getpid()}"
+    conf.setAppName(app_name)
+    conf.setMaster(master)
+    log.info("Spark session configuration: %s", spark_config)
+    for key, value in spark_config:
+        conf.set(key, value)
+    sparkSession = pyspark.sql.SparkSession.builder.config(conf=conf).getOrCreate()
+    log.info("Spark session established.")
+    return sparkSession
+
+# --- Define helper stubs for get_spark() and get_dbutils() ---
+
+def get_spark():
+    """
+    A simple wrapper for get_spark_session.
+    Adjust the spark configuration and master as needed.
+    """
+    # Create a temporary logger for spark session creation.
+    temp_log = logging.getLogger("get_spark")
+    temp_log.setLevel(logging.INFO)
+    spark_config = [("spark.sql.shuffle.partitions", "8")]  # update or add configurations as needed
+    return get_spark_session(temp_log, "tfx_otd", "local[*]", spark_config)
+
+def get_dbutils():
+    """
+    Stub for get_dbutils().
+    In Databricks, dbutils is provided by the runtime environment.
+    """
+    return None
+
+# --- CORE FUNCTION: Data Load for on_time_data_hub_star ---
+
+def get_on_time_data_hub_star(log, spark):
+    """
+    Loads and processes the on_time_data_hub_star data by joining various dimensions and transactional DataFrames.
+    All functions from get_rds and utilities are inlined.
+    """
+    # Load dimensions from RDS
+    cust_dim_df = get_cust_dim(log, spark, RDS_DB_NAME)
+    trade_chanl_hier_dim_df = get_trade_chanl_hier_dim(log, spark, RDS_DB_NAME)
+    
+    # Load Transfix dimension/lookup tables using tvb (kept as is)
+    ship_loc_df = tvb.get_shipping_location_na_dim(log, spark, TRANS_VB_DB_NAME, TARGET_DB_NAME, None, None, None)\
+        .drop("loc_name").drop("state_province_code").drop("postal_code")\
+        .withColumnRenamed("loc_id", "ship_point_code")\
+        .withColumnRenamed("origin_zone_ship_from_code", "sl_origin_zone_ship_from_code")
+    manageOutput(log, spark, ship_loc_df, 1, "ship_loc_df", TARGET_DB_NAME)
+    
+    sambc_df = tvb.get_sambc_master(log, spark, TRANS_VB_DB_NAME, TARGET_DB_NAME, None, None, None)\
+        .select("customer_lvl3_desc", "sambc_flag")
+    manageOutput(log, spark, sambc_df, 1, "sambc_df", TARGET_DB_NAME)
+    
+    csot_bucket_final_df = tvb.get_csot_bucket(log, spark, TRANS_VB_DB_NAME, TARGET_DB_NAME, None, None, None)\
+        .drop("load_id")\
+        .withColumn("poloadid_join", f.col("poload_id"))\
+        .withColumn("cust_po_num", f.col("poload_id"))\
+        .withColumn("load_id", f.col("poload_id"))\
+        .withColumnRenamed("cust_po_num", "pg_order_num")\
+        .drop("cust_po_num")\
+        .withColumnRenamed("poload_id", "poload_id_new")\
+        .drop("poload_id")
+    manageOutput(log, spark, csot_bucket_final_df, 1, "csot_bucket_final_df", TARGET_DB_NAME)
+    
+    actual_ship_time_df = tvb.get_otd_vfr_na_star(log, spark, TRANS_VB_DB_NAME, TARGET_DB_NAME, None, None, None)\
+        .select("shpmt_id", "actual_ship_datetm").distinct()\
+        .withColumn("load_id", f.expr(expr.load_id_expr))\
+        .withColumn("actual_ship_datetm", f.expr(expr.actual_ship_datetm_expr))\
+        .drop("shpmt_id")
+    
+    tms_unload_method_df = tvb.get_tms_unload_method_dest_zone_lkp(log, spark, TRANS_VB_DB_NAME, TARGET_DB_NAME, None, None, None)
+    
+    on_time_df = tvb.get_on_time_arriv_shpmt_custshpmt_na_star(log, spark, TRANS_VB_DB_NAME, TARGET_DB_NAME, None, None, None)\
+        .withColumn("load_id", f.substring(f.col('shpmt_id'), -9, 9))\
+        .withColumn("str_carr_num", f.col('carr_num').cast("int"))\
+        .withColumn("poloadid_join", f.concat(f.col('pg_order_num'), f.col('load_id')))\
+        .withColumn("poload_id", f.concat(f.col('pg_order_num'), f.col('load_id')))\
+        .withColumn("order_create_tmstp", f.concat(f.col('order_create_date'), f.lit(' '), f.col('order_create_datetm')))\
+        .withColumn("schedule_tmstp", f.concat(f.col('plan_shpmt_start_date'), f.lit(' '), f.col('plan_shpmt_start_datetm')))\
+        .withColumn("tender_tmstp", f.concat(f.col('tender_date'), f.lit(' '), f.col('tender_datetm')))\
+        .withColumn("final_lrdt_tmstp", f.concat(f.col('final_lrdt_date'), f.lit(' '), f.col('final_lrdt_datetm')))\
+        .withColumn("actual_load_end_tmstp", f.concat(f.col('actual_load_end_date'), f.lit(' '), f.col('actual_load_end_datetm')))\
+        .withColumn("orig_request_dlvry_from_tmstp", f.concat(f.col('orig_request_dlvry_from_date'), f.lit(' '), f.col('orig_request_dlvry_from_datetm')))\
+        .withColumn("orig_request_dlvry_to_tmstp", f.concat(f.col('orig_request_dlvry_to_date'), f.lit(' '), f.col('orig_request_dlvry_to_datetm')))\
+        .withColumn("request_dlvry_from_tmstp", f.concat(f.col('request_dlvry_from_date'), f.lit(' '), f.col('request_dlvry_from_datetm')))\
+        .withColumn("request_dlvry_to_tmstp", f.concat(f.col('request_dlvry_to_date'), f.lit(' '), f.col('request_dlvry_to_datetm')))\
+        .withColumn("actual_dlvry_tmstp", f.concat(f.col('actual_shpmt_end_date'), f.lit(' '), f.col('actual_shpmt_end_aot_datetm')))\
+        .withColumn("frt_type_desc", f.expr(expr.ci_code_expr))\
+        .withColumn("distance_bin_val", f.expr(expr.bin_code_expr))\
+        .withColumn("parent_shpmt_flag", f.expr(expr.flag_case_code_expr))\
+        .withColumn("shpmt_cnt", f.expr(expr.no_shpmt_expr))\
+        .withColumnRenamed("ship_to_party_id", "customer_id")\
+        .withColumnRenamed("first_tendered_rdd_from", "first_tendered_rdd_from_datetm")\
+        .withColumnRenamed("first_tendered_rdd_to", "first_tendered_rdd_to_datetm")\
+        .withColumn("plan_shpmt_end_tmstp_calc", f.concat(f.col('plan_shpmt_end_date'), f.lit(' '), f.col('plan_shpmt_end_aot_datetm')))\
+        .withColumn("min_event_datetm_rn", f.row_number().over(Window.partitionBy("load_id", "trnsp_stage_num")
+                                                               .orderBy(f.col("event_datetm"))))\
+        .withColumn("max_event_datetm_rn", f.row_number().over(Window.partitionBy("load_id", "trnsp_stage_num")
+                                                               .orderBy(f.col("event_datetm").desc())))\
+        .withColumn("first_dttm", f.expr(expr.min_rn_code_expr))\
+        .withColumn("last_dttm", f.expr(expr.max_rn_code_expr))
+    manageOutput(log, spark, on_time_df, 1, "on_time_df", TARGET_DB_NAME)
+    
+    tfs_df = tvb.get_tfs(log, spark, TARGET_DB_NAME, TARGET_DB_NAME, None, None, None)\
+        .select("shpmt_id", "freight_auction_val")\
+        .filter('freight_auction_val = "YES"')\
+        .withColumn("load_id", f.regexp_replace("shpmt_id", '^0', ''))\
+        .drop("shpmt_id").distinct()
+    
+    tac_df = tvb.get_tac(log, spark, TARGET_DB_NAME, TARGET_DB_NAME, None, None, None)\
+        .withColumn("load_id", f.regexp_replace("load_id", '^0', ''))\
+        .drop("origin_zone_ship_from_code", "origin_loc_id", "carr_desc")\
+        .drop("carr_mode_code", "tender_event_type_code")\
+        .drop("tender_reason_code", "tender_date", "tender_datetm")\
+        .drop("actual_goods_issue_date", "tariff_id", "schedule_code")\
+        .drop("tender_first_carr_desc", "tender_reason_code_desc", "actual_ship_week_day_name")\
+        .drop("ship_cond_val", "postal_code", "final_stop_postal_code")\
+        .drop("country_from_code", "country_to_code", "freight_auction_flag")\
+        .drop("freight_type_code", "origin_zone_code", "daily_award_qty")
+    manageOutput(log, spark, tac_df, 1, "tac_df", TARGET_DB_NAME)
+    
+    log.info("Joining customer with trade channel hierarchy.")
+    trade_chanl_df = cust_dim_df.join(trade_chanl_hier_dim_df, "trade_chanl_id", "inner")\
+        .withColumnRenamed("cust_id", "customer_lvl12_code")
+    manageOutput(log, spark, trade_chanl_df, 1, "trade_chanl_df", TARGET_DB_NAME)
+    
+    log.info("Calculating dates for shipment.")
+    on_time_final_df = on_time_df.groupBy("load_id", "trnsp_stage_num")\
+        .agg(
+            f.max("last_dttm").alias("last_appt_dlvry_tmstp"),
+            f.max("first_dttm").alias("first_appt_dlvry_tmstp")
+        )
+    manageOutput(log, spark, on_time_final_df, 1, "on_time_final_df", TARGET_DB_NAME)
+    
+    log.info("Calculating on time data values for shipment.")
+    shpmt_vals_otd_df = on_time_df.select(
+        "load_id", "event_datetm", "ship_to_party_code", "plan_shpmt_end_date",
+        "plan_shpmt_end_aot_datetm", "ship_cond_code", "otd_cnt",
+        "lot_ontime_status_last_appt_val", "tat_late_counter_val",
+        "service_tms_code", "frt_auction_code", "plan_shpmt_end_tmstp_calc"
+    ).withColumn("shpmt_cnt", f.expr(expr.count_expr))\
+     .withColumn("max_event_datetm_rn", f.row_number().over(Window.partitionBy("load_id")
+                                                                .orderBy(f.col("event_datetm").desc())))\
+     .withColumn("multi_stop_num", f.dense_rank().over(Window.partitionBy("load_id")
+                                                       .orderBy(f.col("ship_to_party_code"))))\
+     .groupBy("load_id")\
+     .agg(
+         f.max(f.expr(expr.tms_code_expr)).alias("actual_service_tms_code"),
+         f.max("multi_stop_num").alias("multi_stop_num"),
+         f.max("plan_shpmt_end_tmstp_calc").alias("plan_shpmt_end_tmstp"),
+         f.max("tat_late_counter_val").alias("max_tat_late_counter_val"),
+         f.max("otd_cnt").alias("max_otd_cnt"),
+         f.max("shpmt_cnt").alias("max_shpmt_cnt"),
+         f.max("frt_auction_code").alias("max_frt_auction_code")
+     )\
+     .withColumn("load_on_time_pct", f.expr(expr.pct_lot_expr))\
+     .withColumn("freight_auction_flag", f.expr(expr.fa_flag_expr))
+    manageOutput(log, spark, shpmt_vals_otd_df, 1, "shpmt_vals_otd_df", TARGET_DB_NAME)
+    
+    log.info("Grouping TAC data for costs data.")
+    tac_calcs_df = tac_df.groupBy("load_id")\
+        .agg(
+            f.max("actual_carr_trans_cost_amt").alias("actual_carr_trans_cost_amt"),
+            f.max("linehaul_cost_amt").alias("linehaul_cost_amt"),
+            f.max("incrmtl_freight_auction_cost_amt").alias("incrmtl_freight_auction_cost_amt"),
+            f.max("cnc_carr_mix_cost_amt").alias("cnc_carr_mix_cost_amt"),
+            f.max("unsource_cost_amt").alias("unsource_cost_amt"),
+            f.max("fuel_cost_amt").alias("fuel_cost_amt"),
+            f.max("acsrl_cost_amt").alias("acsrl_cost_amt"),
+            f.max("dest_ship_from_code").alias("tac_dest_ship_from_code"),
+            f.max("applnc_subsector_step_cnt").alias("applnc_subsector_step_cnt"),
+            f.max("baby_care_subsector_step_cnt").alias("baby_care_subsector_step_cnt"),
+            f.max("chemical_subsector_step_cnt").alias("chemical_subsector_step_cnt"),
+            f.max("fabric_subsector_step_cnt").alias("fabric_subsector_step_cnt"),
+            f.max("family_subsector_step_cnt").alias("family_subsector_step_cnt"),
+            f.max("fem_subsector_step_cnt").alias("fem_subsector_step_cnt"),
+            f.max("hair_subsector_step_cnt").alias("hair_subsector_step_cnt"),
+            f.max("home_subsector_step_cnt").alias("home_subsector_step_cnt"),
+            f.max("oral_subsector_step_cnt").alias("oral_subsector_step_cnt"),
+            f.max("phc_subsector_step_cnt").alias("phc_subsector_step_cnt"),
+            f.max("shave_subsector_step_cnt").alias("shave_subsector_step_cnt"),
+            f.max("skin_subsector_cnt").alias("skin_subsector_cnt"),
+            f.max("other_subsector_cnt").alias("other_subsector_cnt")
+        )
+    
+    log.info("Grouping TAC data for customer hierarchy.")
+    tac_cust_hier_df = tac_df.select(
+        "ship_to_party_id", "customer_code", "customer_lvl1_code", "customer_lvl1_desc",
+        "customer_lvl2_code", "customer_lvl2_desc", "customer_lvl3_code", "customer_lvl3_desc",
+        "customer_lvl4_code", "customer_lvl4_desc", "customer_lvl5_code", "customer_lvl5_desc",
+        "customer_lvl6_code", "customer_lvl6_desc", "customer_lvl7_code", "customer_lvl7_desc",
+        "customer_lvl8_code", "customer_lvl8_desc", "customer_lvl9_code", "customer_lvl9_desc",
+        "customer_lvl10_code", "customer_lvl10_desc", "customer_lvl11_code", "customer_lvl11_desc",
+        "customer_lvl12_code", "customer_lvl12_desc"
+    )\
+    .withColumn("customer_desc", f.expr(expr.customer_desc_expr))\
+    .withColumn("customer_desc", f.regexp_replace(f.col("customer_desc"), "\\(.*\\)", ""))\
+    .drop("customer_code")\
+    .distinct()\
+    .join(trade_chanl_df, "customer_lvl12_code", "left")
+    manageOutput(log, spark, tac_cust_hier_df, 1, "tac_cust_hier_df", TARGET_DB_NAME)
+    
+    log.info("Grouping TAC data.")
+    tac_avg_df = tac_df.selectExpr(
+        "load_id", 
+        "forward_agent_id AS str_carr_num", 
+        "service_tms_code AS actual_service_tms_code",
+        "avg_award_weekly_vol_qty"
+    ).distinct()\
+     .withColumn("primary_carr_flag", f.expr(expr.carr_flag_expr))\
+     .toDF("load_id", "str_carr_num", "actual_service_tms_code", "avg_award_weekly_vol_qty", "primary_carr_flag")
+    
+    log.info("Getting TAC destination zones.")
+    tac_dest_zone_df = tac_df.select("load_id", "tender_event_datetm", "dest_zone_code")\
+        .withColumn("rn", f.row_number().over(Window.partitionBy("load_id").orderBy(f.col("tender_event_datetm"))))\
+        .filter("rn = 1")\
+        .withColumnRenamed("dest_zone_code", "tac_dest_zone_code")\
+        .drop("tender_event_datetm")
+    
+    ship_to_party_final_df = tvb.get_tender_acceptance_na_star(log, spark, TRANS_VB_DB_NAME, TARGET_DB_NAME, None, None, None)\
+        .select("load_id", "ship_to_party_id")\
+        .withColumn("load_id", f.regexp_replace("load_id", '^0', ''))\
+        .distinct()\
+        .join(tac_cust_hier_df, "ship_to_party_id", "left")\
+        .withColumnRenamed("ship_to_party_id", "customer_id")
+    manageOutput(log, spark, ship_to_party_final_df, 1, "ship_to_party_final_df", TARGET_DB_NAME)
+    
+    log.info("Joining final tables.")
+    otd_old_joined_df = on_time_df\
+        .join(shpmt_vals_otd_df, "load_id", "left")\
+        .join(ship_to_party_final_df, "load_id", "left")\
+        .join(actual_ship_time_df, "load_id", "left")\
+        .join(tms_unload_method_df, "load_id", "left")\
+        .join(tac_calcs_df, "load_id", "left")\
+        .join(tac_dest_zone_df, "load_id", "left")\
+        .join(tfs_df, "load_id", "left")\
+        .join(f.broadcast(csot_bucket_final_df), "load_id", "left")\
+        .drop(csot_bucket_final_df.pg_order_num)\
+        .drop(csot_bucket_final_df.poload_id_new)\
+        .drop(csot_bucket_final_df.poloadid_join)\
+        .withColumnRenamed("csot_update_reason_code", "csot_update_reason_code3")\
+        .withColumnRenamed("reason_code", "reason_code3")\
+        .withColumnRenamed("aot_reason_code", "aot_reason_code3")\
+        .join(on_time_final_df, ["load_id", "trnsp_stage_num"], "left")\
+        .join(tac_avg_df, ["load_id", "str_carr_num", "actual_service_tms_code"], "left")\
+        .join(f.broadcast(ship_loc_df), "ship_point_code", "left")\
+        .join(f.broadcast(csot_bucket_final_df), "poloadid_join", "left")\
+        .drop(csot_bucket_final_df.pg_order_num)\
+        .drop(csot_bucket_final_df.poload_id_new)\
+        .drop(csot_bucket_final_df.load_id)\
+        .withColumnRenamed("csot_update_reason_code", "csot_update_reason_code1")\
+        .withColumnRenamed("reason_code", "reason_code1")\
+        .withColumnRenamed("aot_reason_code", "aot_reason_code1")\
+        .join(f.broadcast(csot_bucket_final_df), "pg_order_num", "left")\
+        .drop(csot_bucket_final_df.poload_id_new)\
+        .drop(csot_bucket_final_df.poloadid_join)\
+        .drop(csot_bucket_final_df.load_id)\
+        .withColumnRenamed("csot_update_reason_code", "csot_update_reason_code2")\
+        .withColumnRenamed("reason_code", "reason_code2")\
+        .withColumnRenamed("aot_reason_code", "aot_reason_code2")\
+        .join(f.broadcast(sambc_df), "customer_lvl3_desc", "left")\
+        .withColumn("true_fa_flag", f.expr(expr.true_fa_flag_expr))\
+        .withColumn("csot_update_reason_code", f.expr(expr.csot_update_reason_code_expr))\
+        .withColumn("reason_code", f.expr(expr.reason_code_expr))\
+        .withColumn("aot_reason_code", f.expr(expr.aot_reason_code_expr))\
+        .withColumn("csot_scrubs_value", f.col("csot_update_reason_code"))\
+        .withColumn("aot_measrbl_flag", f.expr(expr.aot_meas_expr))\
+        .withColumn("iot_measrbl_flag", f.expr(expr.iot_meas_expr))\
+        .withColumn("lot_measrbl_flag", f.expr(expr.lot_meas_expr))\
+        .withColumn("csot_measrbl_pos_num", f.expr(expr.csot_pos_expr))\
+        .withColumn("aot_load_id", f.expr(expr.aot_loads_expr))\
+        .withColumn("aot_on_time_load_id", f.expr(expr.aot_loads_on_time_expr))\
+        .withColumn("aot_late_load_id", f.expr(expr.aot_late_loads_expr))\
+        .withColumn("iot_load_id", f.expr(expr.iot_loads_expr))\
+        .withColumn("lot_load_id", f.expr(expr.lot_loads_expr))\
+        .withColumn("lot_on_time_load_id", f.expr(expr.lot_loads_on_time_expr))\
+        .withColumn("lot_late_load_id", f.expr(expr.lot_late_loads_expr))\
+        .withColumn("csot_intrmdt_failure_reason_bucket_updated_name", f.expr(expr.csot_intermediate_failure_reason_bucket_updated_expr))\
+        .withColumn("csot_failure_reason_bucket_updated_name", f.expr(expr.csot_failure_reason_bucket_updated_expr))\
+        .withColumn("csot_on_time_num", f.expr(expr.csot_on_time_expr))\
+        .withColumn("csot_not_on_time_num", f.expr(expr.csot_not_on_time_expr))\
+        .withColumn("in_full_rate", f.lit(""))\
+        .withColumn("otif_qty", f.lit(""))\
+        .withColumn("trnsp_stage_num", f.col('trnsp_stage_num').cast("int"))\
+        .withColumn("actual_ship_tmstp", f.concat(f.col("actual_ship_date"), f.lit(" "),
+                                                  f.coalesce(f.col("actual_ship_datetm"), f.lit("00:00:00"))))\
+        .withColumn("actual_load_method_val", f.col("drop_live_ind_desc"))\
+        .withColumn("dest_zone_code", f.coalesce(f.col("dest_zone_code"), f.col("tac_dest_zone_code")))\
+        .withColumn("origin_zone_ship_from_code", f.expr(expr.origin_zone_ship_from_code_expr))\
+        .withColumn("dest_loc_code", f.regexp_replace("dest_loc_code", '^0+', ''))\
+        .withColumn("true_frt_type_desc", f.expr(expr.true_frt_type_desc_expr))\
+        .withColumn("dest_ship_from_code", f.expr(expr.dest_ship_from_code_expr))\
+        .withColumn("last_update_utc_tmstp", f.to_utc_timestamp(f.from_unixtime(f.unix_timestamp()), 'PRT'))\
+        .withColumn("carr_desc", f.expr(expr.carr_desc_expr))
+    manageOutput(log, spark, otd_old_joined_df, 0, "otd_old_joined_df", TARGET_DB_NAME)
+    
+    on_time_iot_df = otd_old_joined_df.select("load_id", "event_datetm")\
+        .filter("iot_measrbl_flag = 1")\
+        .withColumn("max_event_datetm_rn_iot", f.row_number().over(Window.partitionBy("load_id")
+                                                                    .orderBy(f.col("event_datetm").desc())))
+    
+    otd_joined_df = otd_old_joined_df\
+        .join(on_time_iot_df, ["load_id", "event_datetm"], "left")\
+        .withColumn("iot_on_time_load_id", f.expr(expr.iot_loads_on_time_expr))\
+        .withColumn("iot_late_load_id", f.expr(expr.iot_late_loads_expr))
+    
+    manageOutput(log, spark, otd_joined_df, 0, "otd_joined_df", TARGET_DB_NAME)
+    
+    return otd_joined_df
+
+def load_on_time_data_hub_star(spark, log, target_db_name, target_table):
+    """
+    Refreshes required tables, calls the processing function,
+    and inserts the resulting DataFrame into the target table.
+    """
+    spark.sql(f"REFRESH TABLE {RDS_DB_NAME}.cust_dim")
+    spark.sql(f"REFRESH TABLE {RDS_DB_NAME}.trade_chanl_hier_dim")
+    log.info("Started loading {}.{} table.".format(target_db_name, target_table))
+    
+    df = get_on_time_data_hub_star(log, spark)
+    # If the target table already exists, the new data will overwrite the old data.
+    df.write.insertInto(f"{target_db_name}.{target_table}", overwrite=True)
+    log.info("Loading {}.{} table has finished.".format(target_db_name, target_table))
+    return
+
+# --- MAIN FUNCTION ---
+
+def main():
+    dbutils = get_dbutils()
+    spark = get_spark()
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+    
+    config = Configuration.load_for_default_environment(__file__, dbutils)
+    
+    args = sys.argv
+    catalog = config["catalog-name"]
+    schema = f"{config['catalog-name']}.{config['schema-name']}"
+    
+    # For this load, we use the on_time_data_hub_star target table.
+    target_table = "on_time_data_hub_star"
+    
+    logger.info("Target table: %s", target_table)
+    region = args[1] if len(args) > 1 else "default"
+    regional_db_name = f"{config['src-catalog-name']}.{config['region-schema-name'][region]}"
+    
+    logger.info("Regional source table name: %s", regional_db_name)
+    
+    # Call the load function; adjust parameters as necessary.
+    load_on_time_data_hub_star(
+        spark=spark,
+        log=logger,
+        target_db_name=schema,
+        target_table=target_table
+    )
+
+if __name__ == "__main__":
+    main()
