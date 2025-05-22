@@ -1,0 +1,146 @@
+#!/usr/bin/env python
+import sys
+import os
+import datetime
+import logging
+
+import pyspark
+import pyspark.sql.functions as f
+from pyspark.sql import Window
+
+# Additional library import as requested
+from pg_composite_pipelines_configuration.configuration import Configuration
+
+# Transfix functions used in this script
+from get_src_data import get_transfix as tvb
+
+# --- CONSTANTS (Update these as needed) ---
+TARGET_DB_NAME = "target_db"       # Replace with your target database name
+TRANS_VB_DB_NAME = "trans_vb_db"   # Replace with your Transfix (source) database name
+SPARK_MASTER = "local[*]"          # Adjust for your environment
+SPARK_CONF = [("spark.sql.shuffle.partitions", "8")]
+DEBUG_SUFFIX = "_DEBUG"            # Suffix for debug table names (if needed)
+
+
+# --- INLINE UTILITY FUNCTIONS ---
+
+def manageOutput(log, spark, df, cache_ind, df_name, target_db):
+    """
+    Simplified version of manageOutput.
+    If cache_ind is 1, registers the DataFrame as a temporary view and caches it.
+    For cache_ind = 0, does nothing.
+    """
+    if cache_ind == 1:
+        temp_view = df_name + DEBUG_SUFFIX.upper() + "_CACHE_VW"
+        df.createOrReplaceTempView(temp_view)
+        spark.sql(f"CACHE TABLE {temp_view}")
+        log.info("Data frame '%s' cached as %s.", df_name, temp_view)
+    return
+
+def removeDebugTables(log, spark, target_db):
+    """
+    Remove any tables in target_db that end with DEBUG_SUFFIX (case-insensitive).
+    """
+    debug_postfix = DEBUG_SUFFIX.upper()
+    spark.sql(f"USE {target_db}")
+    tables = spark.sql("SHOW TABLES")
+    log.info("Started dropping DEBUG tables.")
+    for row in tables.collect():
+        if row.tableName.upper().endswith(debug_postfix):
+            spark.sql(f"DROP TABLE IF EXISTS {row.database}.{row.tableName}")
+            log.info("Dropped table %s.%s", row.database, row.tableName)
+    return
+
+def get_spark_session(log, job_prefix, master, spark_config):
+    """
+    Create or get a SparkSession using the provided configuration.
+    """
+    conf = pyspark.SparkConf()
+    dt = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    app_name = f"{job_prefix}_{dt}_{os.getpid()}"
+    conf.setAppName(app_name)
+    conf.setMaster(master)
+    log.info("Spark session configuration: %s", spark_config)
+    for key, value in spark_config:
+        conf.set(key, value)
+    sparkSession = pyspark.sql.SparkSession.builder.config(conf=conf).getOrCreate()
+    log.info("Spark session established.")
+    return sparkSession
+
+def get_dbutils():
+    """
+    Dummy stub for dbutils.
+    In environments such as Databricks, dbutils is provided.
+    """
+    return None
+
+
+# --- IOT FUNCTIONS ---
+
+def get_iot_star(log, spark):
+    """
+    Consolidated function that retrieves and filters CSOT data for INTERPLANT freight.
+    Extra parameters have been removed in favor of constants.
+    """
+    # Retrieve the base CSOT data using get_csot_data (from tvb)
+    csot_data_df = tvb.get_csot_data(
+        log, spark, TARGET_DB_NAME, TARGET_DB_NAME, None, None, None
+    )
+    log.info("Filter csot data.")
+    # Filter for INTERPLANT freight
+    iot_data_df = csot_data_df.where(csot_data_df.freight_type_val == "INTERPLANT")
+    manageOutput(log, spark, iot_data_df, 0, "iot_data_df", TARGET_DB_NAME)
+    log.info("Filter csot data has finished.")
+    return iot_data_df
+
+
+def load_iot_star(log):
+    """
+    Loads the iot_star table by:
+      - Creating a Spark session,
+      - Removing any debug tables,
+      - Refreshing the base table csot_star,
+      - Retrieving the IOT data via get_iot_star,
+      - And writing out the final DataFrame to the target table with overwrite mode.
+    """
+    spark = get_spark_session(log, "tfx_iot", SPARK_MASTER, SPARK_CONF)
+    removeDebugTables(log, spark, TARGET_DB_NAME)
+    
+    log.info("Started loading {}.iot_star table.".format(TARGET_DB_NAME))
+    
+    # Refresh csot_star table if needed
+    refresh_sql = f"refresh table {TARGET_DB_NAME}.csot_star"
+    spark.sql(refresh_sql)
+    
+    # Get target table column list (assumes that the target table already exists)
+    target_table_cols = spark.table(f"{TARGET_DB_NAME}.iot_star").schema.fieldNames()
+    
+    # Get the IOT data and select only the target columns
+    iot_star_df = get_iot_star(log, spark).select(target_table_cols)
+    
+    log.info("Inserting data into {}.iot_star (overwriting old data)".format(TARGET_DB_NAME))
+    iot_star_df.write.insertInto(f"{TARGET_DB_NAME}.iot_star", overwrite=True)
+    log.info("Loading {}.iot_star table has finished.".format(TARGET_DB_NAME))
+    return
+
+
+# --- MAIN FUNCTION ---
+
+def main():
+    dbutils = get_dbutils()
+    # Set up logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+    
+    # Load external configuration if needed (here we ignore it and use constants)
+    config = Configuration.load_for_default_environment(__file__, dbutils)
+    
+    logger.info("Starting load for IOT star table.")
+    load_iot_star(logger)
+
+if __name__ == "__main__":
+    main()
